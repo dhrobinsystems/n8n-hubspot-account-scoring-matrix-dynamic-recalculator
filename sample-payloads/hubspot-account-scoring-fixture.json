@@ -1,0 +1,145 @@
+{
+  "meta": {
+    "fixtureName": "hubspot-account-scoring-fixture",
+    "fixtureVersion": "1.0.0",
+    "synthetic": true,
+    "description": "Sanitized, fully synthetic HubSpot Companies API page used by SANDBOX_MODE. Every company, domain, owner ID and portal ID is fictional. Shape mirrors GET /crm/v3/objects/companies so the same normalizer handles fixture and live data.",
+    "portalId": "99000001",
+    "asOf": "2026-11-16T06:00:00.000Z",
+    "scenarioGuide": {
+      "44001": "Weekly headcount +5.4% + 45-day-old Series B + full CRM/cloud/data match -> upgrade Tier 2 -> Tier 1 (score ~95.5)",
+      "44002": "Headcount +1% + 200-day-old Series C + partial tech match -> stays Tier 2, drift -3.2 is below SCORE_DRIFT_THRESHOLD so no write",
+      "44003": "Headcount -5% + 20-month-old Series A + legacy CRM penalty -> downgrade Tier 2 -> Unqualified (score ~13.7)",
+      "44004": "Never scored + 30-day-old Seed + HubSpot/Azure stack -> initial assignment Tier 2 (score ~78)",
+      "44005": "Missing headcount, funding and technographics -> insufficient_data: no write, previous Tier 3 preserved"
+    }
+  },
+  "results": [
+    {
+      "id": "44001",
+      "properties": {
+        "hs_object_id": "44001",
+        "name": "Apex Logistics",
+        "domain": "apexlogistics.example.com",
+        "industry": "LOGISTICS_AND_SUPPLY_CHAIN",
+        "country": "United States",
+        "hubspot_owner_id": "90000001",
+        "numberofemployees": "432",
+        "icp_headcount_baseline": "410",
+        "icp_headcount_baseline_date": "2026-11-09",
+        "latest_funding_stage": "series_b",
+        "latest_funding_date": "2026-10-02",
+        "latest_funding_amount_usd": "38000000",
+        "technographic_stack": "hubspot;aws;segment;n8n",
+        "icp_scoring_enabled": "true",
+        "icp_fit_score": "64.2",
+        "icp_account_tier": "tier_2",
+        "icp_last_recalculated_at": "2026-11-09T06:00:12.000Z"
+      },
+      "createdAt": "2025-02-11T14:22:05.000Z",
+      "updatedAt": "2026-11-15T21:04:44.000Z",
+      "archived": false
+    },
+    {
+      "id": "44002",
+      "properties": {
+        "hs_object_id": "44002",
+        "name": "Vanguard Cloud",
+        "domain": "vanguardcloud.example.com",
+        "industry": "COMPUTER_SOFTWARE",
+        "country": "Canada",
+        "hubspot_owner_id": "90000002",
+        "numberofemployees": "1262",
+        "icp_headcount_baseline": "1250",
+        "icp_headcount_baseline_date": "2026-11-09",
+        "latest_funding_stage": "series_c",
+        "latest_funding_date": "2026-04-30",
+        "latest_funding_amount_usd": "120000000",
+        "technographic_stack": "salesforce;gcp;snowflake",
+        "icp_scoring_enabled": "true",
+        "icp_fit_score": "79.0",
+        "icp_account_tier": "tier_2",
+        "icp_last_recalculated_at": "2026-11-09T06:00:12.000Z"
+      },
+      "createdAt": "2024-09-03T09:15:40.000Z",
+      "updatedAt": "2026-11-14T10:31:02.000Z",
+      "archived": false
+    },
+    {
+      "id": "44003",
+      "properties": {
+        "hs_object_id": "44003",
+        "name": "Brightfield Robotics",
+        "domain": "brightfieldrobotics.example.com",
+        "industry": "INDUSTRIAL_AUTOMATION",
+        "country": "Germany",
+        "hubspot_owner_id": "90000003",
+        "numberofemployees": "171",
+        "icp_headcount_baseline": "180",
+        "icp_headcount_baseline_date": "2026-11-09",
+        "latest_funding_stage": "series_a",
+        "latest_funding_date": "2025-03-21",
+        "latest_funding_amount_usd": "12000000",
+        "technographic_stack": "legacy_on_prem_crm;azure",
+        "icp_scoring_enabled": "true",
+        "icp_fit_score": "58.5",
+        "icp_account_tier": "tier_2",
+        "icp_last_recalculated_at": "2026-11-09T06:00:12.000Z"
+      },
+      "createdAt": "2025-06-18T16:48:19.000Z",
+      "updatedAt": "2026-11-12T08:12:57.000Z",
+      "archived": false
+    },
+    {
+      "id": "44004",
+      "properties": {
+        "hs_object_id": "44004",
+        "name": "Cobalt Harbor Health",
+        "domain": "cobaltharborhealth.example.com",
+        "industry": "HOSPITAL_HEALTH_CARE",
+        "country": "United Kingdom",
+        "hubspot_owner_id": "90000001",
+        "numberofemployees": "78",
+        "icp_headcount_baseline": "75",
+        "icp_headcount_baseline_date": "2026-11-09",
+        "latest_funding_stage": "seed",
+        "latest_funding_date": "2026-10-17",
+        "latest_funding_amount_usd": "4500000",
+        "technographic_stack": "hubspot;azure;zapier",
+        "icp_scoring_enabled": "true",
+        "icp_fit_score": "",
+        "icp_account_tier": "",
+        "icp_last_recalculated_at": ""
+      },
+      "createdAt": "2026-11-10T11:05:33.000Z",
+      "updatedAt": "2026-11-13T13:40:21.000Z",
+      "archived": false
+    },
+    {
+      "id": "44005",
+      "properties": {
+        "hs_object_id": "44005",
+        "name": "Lumen Ridge Retail",
+        "domain": "lumenridgeretail.example.com",
+        "industry": "RETAIL",
+        "country": "Australia",
+        "hubspot_owner_id": "90000002",
+        "numberofemployees": "",
+        "icp_headcount_baseline": "",
+        "icp_headcount_baseline_date": "",
+        "latest_funding_stage": "",
+        "latest_funding_date": "",
+        "latest_funding_amount_usd": "",
+        "technographic_stack": "",
+        "icp_scoring_enabled": "true",
+        "icp_fit_score": "41.0",
+        "icp_account_tier": "tier_3",
+        "icp_last_recalculated_at": "2026-10-19T06:00:09.000Z"
+      },
+      "createdAt": "2025-11-27T19:30:00.000Z",
+      "updatedAt": "2026-10-19T06:00:09.000Z",
+      "archived": false
+    }
+  ],
+  "paging": null
+}
