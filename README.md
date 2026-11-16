@@ -44,6 +44,8 @@ Every Monday this n8n workflow reads company records from HubSpot (or a syntheti
 
 ### Data flow
 
+![HubSpot Account Scoring Matrix — Dynamic Recalculator Workflow Overview](workflow-overview.png)
+
 ```mermaid
 flowchart LR
     A1([Weekly Monday Schedule<br/>cron 0 6 * * 1]) --> B
