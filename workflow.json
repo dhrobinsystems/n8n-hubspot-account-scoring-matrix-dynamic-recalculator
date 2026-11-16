@@ -1,0 +1,797 @@
+{
+  "name": "HubSpot Account Scoring Matrix — Dynamic Recalculator",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "3b35c394-16d9-59cf-a744-93ba8c89f85f",
+      "name": "Weekly Monday Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Mondays 06:00 (workflow timezone, default UTC)",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "051e004f-9a56-5253-9c5d-03ef3f8c4a6d",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Config & Safety Gate\n// Reads every setting from environment variables and resolves the\n// effective execution mode. SAFE BY DEFAULT: if a variable is missing,\n// or env access is blocked, the workflow runs in sandbox + dry-run with\n// all CRM writes and outbound alerts disabled.\n// Secrets are NEVER copied into execution data — only presence booleans.\n// =====================================================================\nlet envAccessible = true;\ntry { void $env.SANDBOX_MODE; } catch (e) { envAccessible = false; }\n\nconst readEnv = (name) => {\n  try {\n    const v = $env[name];\n    if (v === undefined || v === null) return undefined;\n    const s = String(v).trim();\n    return s === '' ? undefined : s;\n  } catch (e) {\n    return undefined;\n  }\n};\nconst bool = (name, dflt) => {\n  const v = readEnv(name);\n  if (v === undefined) return dflt;\n  return ['true', '1', 'yes', 'on'].includes(v.toLowerCase());\n};\nconst num = (name, dflt) => {\n  const v = readEnv(name);\n  if (v === undefined) return dflt;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : dflt;\n};\nconst str = (name, dflt) => {\n  const v = readEnv(name);\n  return v === undefined ? dflt : v;\n};\nconst list = (name, dflt) => {\n  const v = readEnv(name);\n  if (v === undefined) return dflt;\n  return v.split(',').map((x) => x.trim()).filter(Boolean);\n};\nconst jsonEnv = (name, dflt, warnings) => {\n  const v = readEnv(name);\n  if (v === undefined) return dflt;\n  try { return JSON.parse(v); } catch (e) {\n    warnings.push(`${name} is not valid JSON; using built-in default.`);\n    return dflt;\n  }\n};\n\nconst warnings = [];\nif (!envAccessible) {\n  warnings.push('Environment variable access is blocked (N8N_BLOCK_ENV_ACCESS_IN_NODE=true). Running with safe defaults: sandbox + dry-run.');\n}\n\n// ---------- Safety flags (safe defaults) ----------\nconst sandboxMode = bool('SANDBOX_MODE', true);\nconst dryRun = bool('DRY_RUN', true);\nconst scoreUpdateEnabled = bool('SCORE_UPDATE_ENABLED', false);\nconst sendSlackAlerts = bool('SEND_SLACK_ALERTS', false);\nconst sendAuditWebhook = bool('SEND_AUDIT_WEBHOOK', false);\n\nconst hasHubspotToken = readEnv('HUBSPOT_ACCESS_TOKEN') !== undefined;\nconst hasSlackWebhook = readEnv('SLACK_SCORING_WEBHOOK_URL') !== undefined;\nconst hasAuditWebhook = readEnv('ALERT_WEBHOOK_URL') !== undefined;\n\nif (!sandboxMode && !hasHubspotToken) {\n  throw new Error('SANDBOX_MODE=false requires HUBSPOT_ACCESS_TOKEN. Set the token or switch SANDBOX_MODE back to true.');\n}\n\nlet writeMode = 'live';\nif (sandboxMode) writeMode = 'sandbox';\nelse if (dryRun) writeMode = 'dry_run';\nelse if (!scoreUpdateEnabled) writeMode = 'updates_disabled';\nelse if (!hasHubspotToken) writeMode = 'missing_token';\nconst liveWrite = writeMode === 'live';\n\nconst slackLive = sendSlackAlerts && !dryRun && hasSlackWebhook;\nconst auditWebhookLive = sendAuditWebhook && !dryRun && hasAuditWebhook;\nif (sendSlackAlerts && !hasSlackWebhook) warnings.push('SEND_SLACK_ALERTS=true but SLACK_SCORING_WEBHOOK_URL is not set; Slack disabled.');\nif (sendAuditWebhook && !hasAuditWebhook) warnings.push('SEND_AUDIT_WEBHOOK=true but ALERT_WEBHOOK_URL is not set; audit webhook disabled.');\nif (sendSlackAlerts && dryRun) warnings.push('SEND_SLACK_ALERTS=true is ignored while DRY_RUN=true (preview only).');\n\n// ---------- Scoring weights (normalized to sum = 1) ----------\nconst rawWeights = {\n  headcountGrowth: Math.max(0, num('WEIGHT_HEADCOUNT_GROWTH', 0.30)),\n  funding: Math.max(0, num('WEIGHT_FUNDING', 0.30)),\n  technographic: Math.max(0, num('WEIGHT_TECHNOGRAPHIC', 0.25)),\n  firmographic: Math.max(0, num('WEIGHT_FIRMOGRAPHIC', 0.15)),\n};\nlet weightSum = Object.values(rawWeights).reduce((a, b) => a + b, 0);\nif (weightSum <= 0) {\n  warnings.push('All scoring weights are zero; falling back to default weights.');\n  Object.assign(rawWeights, { headcountGrowth: 0.30, funding: 0.30, technographic: 0.25, firmographic: 0.15 });\n  weightSum = 1;\n}\nconst weights = {};\nfor (const [k, v] of Object.entries(rawWeights)) weights[k] = Math.round((v / weightSum) * 10000) / 10000;\n\n// ---------- Tier thresholds ----------\nconst tiers = {\n  tier1Min: num('TIER_1_MIN_SCORE', 80),\n  tier2Min: num('TIER_2_MIN_SCORE', 60),\n  tier3Min: num('TIER_3_MIN_SCORE', 40),\n  hysteresisPoints: Math.max(0, num('TIER_HYSTERESIS_POINTS', 3)),\n};\nif (!(tiers.tier1Min > tiers.tier2Min && tiers.tier2Min > tiers.tier3Min && tiers.tier3Min >= 0 && tiers.tier1Min <= 100)) {\n  throw new Error(`Invalid tier thresholds: require 100 >= TIER_1_MIN_SCORE (${tiers.tier1Min}) > TIER_2_MIN_SCORE (${tiers.tier2Min}) > TIER_3_MIN_SCORE (${tiers.tier3Min}) >= 0.`);\n}\n\n// ---------- Signal matrices ----------\nconst defaultStagePoints = { seed: 45, series_a: 65, series_b: 85, series_c: 100, series_d_plus: 80, ipo: 40, none: 0 };\nconst defaultTechMatrix = {\n  crm: { hubspot: 40, salesforce: 30, pipedrive: 15 },\n  cloud_hosting: { aws: 25, gcp: 25, azure: 25 },\n  data_stack: { snowflake: 15, segment: 15, bigquery: 10 },\n  automation: { n8n: 10, zapier: 5, make: 5 },\n  negative_signals: { legacy_on_prem_crm: -25 },\n};\n\nconst scoring = {\n  weights,\n  tiers,\n  minComponents: Math.max(1, Math.min(4, num('MIN_SIGNAL_COMPONENTS', 2))),\n  driftThreshold: Math.max(0, num('SCORE_DRIFT_THRESHOLD', 5)),\n  staleAfterDays: Math.max(1, num('STALE_SCORE_REFRESH_DAYS', 28)),\n  writePolicy: str('WRITE_POLICY', 'changes_only') === 'all' ? 'all' : 'changes_only',\n  headcount: {\n    growthCeilingPct: Math.max(0.1, num('HEADCOUNT_GROWTH_CEILING_PCT', 3)),\n    declineFloorPct: Math.min(-0.1, num('HEADCOUNT_DECLINE_FLOOR_PCT', -3)),\n    flatScore: Math.min(100, Math.max(0, num('HEADCOUNT_FLAT_SCORE', 40))),\n    maxBaselineAgeDays: Math.max(7, num('HEADCOUNT_MAX_BASELINE_AGE_DAYS', 35)),\n  },\n  funding: {\n    stagePoints: jsonEnv('FUNDING_STAGE_POINTS_JSON', defaultStagePoints, warnings),\n    fullCreditDays: Math.max(0, num('FUNDING_FULL_CREDIT_DAYS', 90)),\n    decayDays: Math.max(1, num('FUNDING_DECAY_DAYS', 540)),\n    floorMultiplier: Math.min(1, Math.max(0, num('FUNDING_FLOOR_MULTIPLIER', 0.15))),\n    unknownDateMultiplier: Math.min(1, Math.max(0, num('FUNDING_UNKNOWN_DATE_MULTIPLIER', 0.5))),\n  },\n  techMatrix: jsonEnv('TECH_MATRIX_JSON', defaultTechMatrix, warnings),\n  firmographic: {\n    employeeMin: Math.max(1, num('ICP_EMPLOYEE_MIN', 50)),\n    employeeMax: Math.max(2, num('ICP_EMPLOYEE_MAX', 2000)),\n    targetIndustries: list('ICP_TARGET_INDUSTRIES', [\n      'LOGISTICS_AND_SUPPLY_CHAIN', 'COMPUTER_SOFTWARE', 'HOSPITAL_HEALTH_CARE', 'INFORMATION_TECHNOLOGY_AND_SERVICES',\n    ]).map((x) => x.toUpperCase()),\n    offTargetIndustryScore: Math.min(100, Math.max(0, num('ICP_OFF_TARGET_INDUSTRY_SCORE', 30))),\n    employeeBandWeight: 0.6,\n    industryWeight: 0.4,\n  },\n};\nif (scoring.funding.decayDays <= scoring.funding.fullCreditDays) {\n  scoring.funding.decayDays = scoring.funding.fullCreditDays + 1;\n  warnings.push('FUNDING_DECAY_DAYS must exceed FUNDING_FULL_CREDIT_DAYS; adjusted automatically.');\n}\n\n// ---------- HubSpot property mapping (override to match your portal) ----------\nconst properties = {\n  score: str('HS_PROP_ICP_SCORE', 'icp_fit_score'),\n  tier: str('HS_PROP_ACCOUNT_TIER', 'icp_account_tier'),\n  recalculatedAt: str('HS_PROP_RECALCULATED_AT', 'icp_last_recalculated_at'),\n  scoreDelta: str('HS_PROP_SCORE_DELTA', 'icp_score_delta'),\n  scoreBreakdown: str('HS_PROP_SCORE_BREAKDOWN', 'icp_score_breakdown'),\n  headcountBaseline: str('HS_PROP_HEADCOUNT_BASELINE', 'icp_headcount_baseline'),\n  headcountBaselineDate: str('HS_PROP_HEADCOUNT_BASELINE_DATE', 'icp_headcount_baseline_date'),\n  fundingStage: str('HS_PROP_FUNDING_STAGE', 'latest_funding_stage'),\n  fundingDate: str('HS_PROP_FUNDING_DATE', 'latest_funding_date'),\n  fundingAmount: str('HS_PROP_FUNDING_AMOUNT', 'latest_funding_amount_usd'),\n  techStack: str('HS_PROP_TECH_STACK', 'technographic_stack'),\n};\nconst scoringScopeProperty = str('SCORING_SCOPE_PROPERTY', '');\nconst hubspotReadProperties = [...new Set([\n  'name', 'domain', 'industry', 'country', 'numberofemployees', 'hubspot_owner_id',\n  properties.score, properties.tier, properties.recalculatedAt,\n  properties.headcountBaseline, properties.headcountBaselineDate,\n  properties.fundingStage, properties.fundingDate, properties.fundingAmount, properties.techStack,\n  ...(scoringScopeProperty ? [scoringScopeProperty] : []),\n])];\n\nconst runStartedAt = new Date().toISOString();\nlet executionId = 'manual';\ntry { executionId = String($execution.id); } catch (e) { /* not available in some contexts */ }\n\nreturn [{\n  json: {\n    runId: `icp-recalc-${runStartedAt.replace(/[-:.TZ]/g, '').slice(0, 14)}-${executionId}`,\n    runStartedAt,\n    referenceDateOverride: str('SCORING_REFERENCE_DATE', null),\n    envAccessible,\n    sandboxMode,\n    dryRun,\n    scoreUpdateEnabled,\n    sendSlackAlerts,\n    sendAuditWebhook,\n    liveRead: !sandboxMode,\n    liveWrite,\n    writeMode,\n    slackLive,\n    auditWebhookLive,\n    credentialsPresent: { hubspotAccessToken: hasHubspotToken, slackWebhook: hasSlackWebhook, auditWebhook: hasAuditWebhook },\n    hubspot: {\n      apiBaseUrl: str('HUBSPOT_API_BASE_URL', 'https://api.hubapi.com').replace(/\\/+$/, ''),\n      portalId: str('HUBSPOT_PORTAL_ID', '99000001'),\n      batchSize: Math.min(100, Math.max(1, num('HUBSPOT_BATCH_SIZE', 100))),\n      pageSize: Math.min(100, Math.max(1, num('HUBSPOT_PAGE_SIZE', 100))),\n    },\n    hubspotReadProperties,\n    hubspotReadPropertiesCsv: hubspotReadProperties.join(','),\n    scoringScopeProperty,\n    properties,\n    scoring,\n    safety: {\n      maxWritesPerRun: Math.max(1, num('MAX_WRITES_PER_RUN', 500)),\n      maxTierChangeRatio: Math.min(1, Math.max(0, num('MAX_TIER_CHANGE_RATIO', 0.35))),\n      circuitBreakerMinSample: Math.max(1, num('CIRCUIT_BREAKER_MIN_SAMPLE', 20)),\n    },\n    slack: {\n      channelLabel: str('SLACK_CHANNEL_LABEL', '#revops-scoring'),\n      maxListItems: Math.min(15, Math.max(1, num('SLACK_MAX_LIST_ITEMS', 8))),\n    },\n    warnings,\n  },\n}];\n"
+      },
+      "id": "abcd9b97-1c83-516a-9070-b3dd61e036dc",
+      "name": "Config & Safety Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        400
+      ],
+      "notes": "Env-driven config. Defaults: SANDBOX + DRY_RUN, writes OFF",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "be0e72f7-1d84-57b6-adde-fb8956a28ad9",
+              "leftValue": "={{ $json.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3fa75d1a-854d-5ed4-9454-15a9bc33ccfd",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        480,
+        400
+      ],
+      "notes": "true → synthetic fixture · false → HubSpot API",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Load Synthetic Fixture (SANDBOX_MODE only)\n// Emits a page shaped exactly like GET /crm/v3/objects/companies so the\n// downstream normalizer is identical for sandbox and live runs.\n// Mirrors sample-payloads/hubspot-account-scoring-fixture.json.\n// All companies, domains, owner IDs and the portal ID are fictional.\n// =====================================================================\nconst FIXTURE = {\n  \"meta\": {\n    \"fixtureName\": \"hubspot-account-scoring-fixture\",\n    \"fixtureVersion\": \"1.0.0\",\n    \"synthetic\": true,\n    \"description\": \"Sanitized, fully synthetic HubSpot Companies API page used by SANDBOX_MODE. Every company, domain, owner ID and portal ID is fictional. Shape mirrors GET /crm/v3/objects/companies so the same normalizer handles fixture and live data.\",\n    \"portalId\": \"99000001\",\n    \"asOf\": \"2026-11-16T06:00:00.000Z\",\n    \"scenarioGuide\": {\n      \"44001\": \"Weekly headcount +5.4% + 45-day-old Series B + full CRM/cloud/data match -> upgrade Tier 2 -> Tier 1 (score ~95.5)\",\n      \"44002\": \"Headcount +1% + 200-day-old Series C + partial tech match -> stays Tier 2, drift -3.2 is below SCORE_DRIFT_THRESHOLD so no write\",\n      \"44003\": \"Headcount -5% + 20-month-old Series A + legacy CRM penalty -> downgrade Tier 2 -> Unqualified (score ~13.7)\",\n      \"44004\": \"Never scored + 30-day-old Seed + HubSpot/Azure stack -> initial assignment Tier 2 (score ~78)\",\n      \"44005\": \"Missing headcount, funding and technographics -> insufficient_data: no write, previous Tier 3 preserved\"\n    }\n  },\n  \"results\": [\n    {\n      \"id\": \"44001\",\n      \"properties\": {\n        \"hs_object_id\": \"44001\",\n        \"name\": \"Apex Logistics\",\n        \"domain\": \"apexlogistics.example.com\",\n        \"industry\": \"LOGISTICS_AND_SUPPLY_CHAIN\",\n        \"country\": \"United States\",\n        \"hubspot_owner_id\": \"90000001\",\n        \"numberofemployees\": \"432\",\n        \"icp_headcount_baseline\": \"410\",\n        \"icp_headcount_baseline_date\": \"2026-11-09\",\n        \"latest_funding_stage\": \"series_b\",\n        \"latest_funding_date\": \"2026-10-02\",\n        \"latest_funding_amount_usd\": \"38000000\",\n        \"technographic_stack\": \"hubspot;aws;segment;n8n\",\n        \"icp_scoring_enabled\": \"true\",\n        \"icp_fit_score\": \"64.2\",\n        \"icp_account_tier\": \"tier_2\",\n        \"icp_last_recalculated_at\": \"2026-11-09T06:00:12.000Z\"\n      },\n      \"createdAt\": \"2025-02-11T14:22:05.000Z\",\n      \"updatedAt\": \"2026-11-15T21:04:44.000Z\",\n      \"archived\": false\n    },\n    {\n      \"id\": \"44002\",\n      \"properties\": {\n        \"hs_object_id\": \"44002\",\n        \"name\": \"Vanguard Cloud\",\n        \"domain\": \"vanguardcloud.example.com\",\n        \"industry\": \"COMPUTER_SOFTWARE\",\n        \"country\": \"Canada\",\n        \"hubspot_owner_id\": \"90000002\",\n        \"numberofemployees\": \"1262\",\n        \"icp_headcount_baseline\": \"1250\",\n        \"icp_headcount_baseline_date\": \"2026-11-09\",\n        \"latest_funding_stage\": \"series_c\",\n        \"latest_funding_date\": \"2026-04-30\",\n        \"latest_funding_amount_usd\": \"120000000\",\n        \"technographic_stack\": \"salesforce;gcp;snowflake\",\n        \"icp_scoring_enabled\": \"true\",\n        \"icp_fit_score\": \"79.0\",\n        \"icp_account_tier\": \"tier_2\",\n        \"icp_last_recalculated_at\": \"2026-11-09T06:00:12.000Z\"\n      },\n      \"createdAt\": \"2024-09-03T09:15:40.000Z\",\n      \"updatedAt\": \"2026-11-14T10:31:02.000Z\",\n      \"archived\": false\n    },\n    {\n      \"id\": \"44003\",\n      \"properties\": {\n        \"hs_object_id\": \"44003\",\n        \"name\": \"Brightfield Robotics\",\n        \"domain\": \"brightfieldrobotics.example.com\",\n        \"industry\": \"INDUSTRIAL_AUTOMATION\",\n        \"country\": \"Germany\",\n        \"hubspot_owner_id\": \"90000003\",\n        \"numberofemployees\": \"171\",\n        \"icp_headcount_baseline\": \"180\",\n        \"icp_headcount_baseline_date\": \"2026-11-09\",\n        \"latest_funding_stage\": \"series_a\",\n        \"latest_funding_date\": \"2025-03-21\",\n        \"latest_funding_amount_usd\": \"12000000\",\n        \"technographic_stack\": \"legacy_on_prem_crm;azure\",\n        \"icp_scoring_enabled\": \"true\",\n        \"icp_fit_score\": \"58.5\",\n        \"icp_account_tier\": \"tier_2\",\n        \"icp_last_recalculated_at\": \"2026-11-09T06:00:12.000Z\"\n      },\n      \"createdAt\": \"2025-06-18T16:48:19.000Z\",\n      \"updatedAt\": \"2026-11-12T08:12:57.000Z\",\n      \"archived\": false\n    },\n    {\n      \"id\": \"44004\",\n      \"properties\": {\n        \"hs_object_id\": \"44004\",\n        \"name\": \"Cobalt Harbor Health\",\n        \"domain\": \"cobaltharborhealth.example.com\",\n        \"industry\": \"HOSPITAL_HEALTH_CARE\",\n        \"country\": \"United Kingdom\",\n        \"hubspot_owner_id\": \"90000001\",\n        \"numberofemployees\": \"78\",\n        \"icp_headcount_baseline\": \"75\",\n        \"icp_headcount_baseline_date\": \"2026-11-09\",\n        \"latest_funding_stage\": \"seed\",\n        \"latest_funding_date\": \"2026-10-17\",\n        \"latest_funding_amount_usd\": \"4500000\",\n        \"technographic_stack\": \"hubspot;azure;zapier\",\n        \"icp_scoring_enabled\": \"true\",\n        \"icp_fit_score\": \"\",\n        \"icp_account_tier\": \"\",\n        \"icp_last_recalculated_at\": \"\"\n      },\n      \"createdAt\": \"2026-11-10T11:05:33.000Z\",\n      \"updatedAt\": \"2026-11-13T13:40:21.000Z\",\n      \"archived\": false\n    },\n    {\n      \"id\": \"44005\",\n      \"properties\": {\n        \"hs_object_id\": \"44005\",\n        \"name\": \"Lumen Ridge Retail\",\n        \"domain\": \"lumenridgeretail.example.com\",\n        \"industry\": \"RETAIL\",\n        \"country\": \"Australia\",\n        \"hubspot_owner_id\": \"90000002\",\n        \"numberofemployees\": \"\",\n        \"icp_headcount_baseline\": \"\",\n        \"icp_headcount_baseline_date\": \"\",\n        \"latest_funding_stage\": \"\",\n        \"latest_funding_date\": \"\",\n        \"latest_funding_amount_usd\": \"\",\n        \"technographic_stack\": \"\",\n        \"icp_scoring_enabled\": \"true\",\n        \"icp_fit_score\": \"41.0\",\n        \"icp_account_tier\": \"tier_3\",\n        \"icp_last_recalculated_at\": \"2026-10-19T06:00:09.000Z\"\n      },\n      \"createdAt\": \"2025-11-27T19:30:00.000Z\",\n      \"updatedAt\": \"2026-10-19T06:00:09.000Z\",\n      \"archived\": false\n    }\n  ],\n  \"paging\": null\n};\n\nconst cfg = $('Config & Safety Gate').first().json;\nif (!cfg.sandboxMode) {\n  throw new Error('Synthetic fixture loaded while SANDBOX_MODE=false. Check the \"Sandbox Mode?\" routing.');\n}\nreturn [{ json: JSON.parse(JSON.stringify(FIXTURE)) }];\n"
+      },
+      "id": "aad62ce2-2577-55c6-a926-57d8d8a50aab",
+      "name": "Load Synthetic Fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        280
+      ],
+      "notes": "Fictional companies 44001–44005, portal 99000001",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.hubspot.apiBaseUrl }}/crm/v3/objects/companies",
+        "authentication": "none",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "={{ $json.hubspot.pageSize }}"
+            },
+            {
+              "name": "properties",
+              "value": "={{ $json.hubspotReadPropertiesCsv }}"
+            },
+            {
+              "name": "archived",
+              "value": "false"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "after",
+                    "value": "={{ $response.body.paging.next.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next }}",
+              "limitPagesFetched": true,
+              "maxRequests": 50,
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "687f913f-1a04-55c9-bf6b-734c4680d848",
+      "name": "HubSpot: List Companies",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        520
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "Read-only GET, paginated (max 50 pages × 100)",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Normalize Company Signals\n// Flattens one or more HubSpot list pages (live, paginated) or the\n// synthetic fixture page into one item per company with typed signals.\n// =====================================================================\nconst cfg = $('Config & Safety Gate').first().json;\nconst P = cfg.properties;\nconst pages = $input.all().map((i) => i.json || {});\n\nconst toStr = (v) => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());\nconst toNum = (v) => {\n  const s = toStr(v);\n  if (s === null) return null;\n  const n = Number(s.replace(/,/g, ''));\n  return Number.isFinite(n) ? n : null;\n};\nconst toIso = (v) => {\n  const s = toStr(v);\n  if (s === null) return null;\n  const d = /^\\d{10,}$/.test(s) ? new Date(Number(s)) : new Date(s);\n  return Number.isNaN(d.getTime()) ? null : d.toISOString();\n};\nconst toList = (v) => {\n  const s = toStr(v);\n  if (s === null) return [];\n  return [...new Set(s.split(/[;,]/).map((x) => x.trim().toLowerCase().replace(/\\s+/g, '_')).filter(Boolean))];\n};\nconst normalizeStage = (v) => {\n  const s = toStr(v);\n  if (s === null) return null;\n  const k = s.toLowerCase().replace(/[\\s-]+/g, '_');\n  if (['pre_seed', 'preseed', 'seed', 'angel'].includes(k)) return 'seed';\n  if (['series_a', 'a'].includes(k)) return 'series_a';\n  if (['series_b', 'b'].includes(k)) return 'series_b';\n  if (['series_c', 'c'].includes(k)) return 'series_c';\n  if (/^series_[d-z]/.test(k) || ['series_d_plus', 'growth', 'late_stage', 'private_equity'].includes(k)) return 'series_d_plus';\n  if (['ipo', 'public', 'post_ipo'].includes(k)) return 'ipo';\n  if (['none', 'bootstrapped', 'unfunded', 'no_funding'].includes(k)) return 'none';\n  return 'unknown';\n};\n\nlet referenceDate = null;\nconst records = [];\nfor (const page of pages) {\n  if (page.meta && page.meta.asOf && cfg.sandboxMode) referenceDate = page.meta.asOf;\n  if (Array.isArray(page.results)) records.push(...page.results);\n}\n\nconst stats = { pagesRead: pages.length, recordsRead: records.length, duplicates: 0, archived: 0, outOfScope: 0, invalid: 0, normalized: 0 };\nconst seen = new Set();\nconst out = [];\n\nfor (const r of records) {\n  if (!r || r.id === undefined || r.id === null) { stats.invalid++; continue; }\n  const id = String(r.id);\n  if (seen.has(id)) { stats.duplicates++; continue; }\n  seen.add(id);\n  if (r.archived === true) { stats.archived++; continue; }\n  const p = r.properties || {};\n  if (cfg.scoringScopeProperty) {\n    const flag = toStr(p[cfg.scoringScopeProperty]);\n    if (!flag || !['true', 'yes', '1'].includes(flag.toLowerCase())) { stats.outOfScope++; continue; }\n  }\n  out.push({\n    companyId: id,\n    name: toStr(p.name) || `Company ${id}`,\n    domain: toStr(p.domain),\n    industry: toStr(p.industry) ? toStr(p.industry).toUpperCase() : null,\n    country: toStr(p.country),\n    ownerId: toStr(p.hubspot_owner_id),\n    employeesCurrent: toNum(p.numberofemployees),\n    employeesBaseline: toNum(p[P.headcountBaseline]),\n    baselineDate: toIso(p[P.headcountBaselineDate]),\n    fundingStage: normalizeStage(p[P.fundingStage]),\n    fundingDate: toIso(p[P.fundingDate]),\n    fundingAmountUsd: toNum(p[P.fundingAmount]),\n    technographics: toList(p[P.techStack]),\n    previousScore: toNum(p[P.score]),\n    previousTierRaw: toStr(p[P.tier]),\n    previousCalculatedAt: toIso(p[P.recalculatedAt]),\n    source: cfg.sandboxMode ? 'synthetic_fixture' : 'hubspot_api',\n  });\n}\nstats.normalized = out.length;\n\nconst ingest = { ...stats, referenceDate };\nif (out.length === 0) {\n  return [{ json: { _noRecords: true, _ingest: ingest } }];\n}\nreturn out.map((c) => ({ json: { ...c, _ingest: ingest } }));\n"
+      },
+      "id": "e6847242-ba1a-596c-ad39-9452971a6d83",
+      "name": "Normalize Company Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        400
+      ],
+      "notes": "Same normalizer for fixture and live pages",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Account Scoring & Tier Recalibration Engine\n// Composite ICP fit score (0-100) from four weighted components:\n//   1. Headcount growth velocity (weekly-equivalent % change vs baseline)\n//   2. Funding signal (stage points x recency decay)\n//   3. Technographic match (category-capped tech matrix, with penalties)\n//   4. Firmographic fit (employee band + target industry)\n// Missing components are excluded and remaining weights renormalized.\n// Tiers use hysteresis on downgrades to prevent week-to-week flapping.\n// Drift and tier changes are measured against the last stored values.\n// =====================================================================\nconst cfg = $('Config & Safety Gate').first().json;\nconst S = cfg.scoring;\nconst P = cfg.properties;\nconst inputs = $input.all().map((i) => i.json);\n\nif (inputs.length === 1 && inputs[0]._noRecords) {\n  return [{ json: { _noRecords: true, _ingest: inputs[0]._ingest } }];\n}\n\nconst DAY = 86400000;\nconst ingest = inputs[0]._ingest || {};\nconst referenceIso = cfg.referenceDateOverride || ingest.referenceDate || cfg.runStartedAt;\nconst ref = new Date(referenceIso);\nif (Number.isNaN(ref.getTime())) throw new Error(`Invalid scoring reference date: ${referenceIso}`);\n\nconst round1 = (n) => Math.round(n * 10) / 10;\nconst clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));\n\nconst TIERS = [\n  { label: 'Tier 1', value: 'tier_1', rank: 3, min: S.tiers.tier1Min },\n  { label: 'Tier 2', value: 'tier_2', rank: 2, min: S.tiers.tier2Min },\n  { label: 'Tier 3', value: 'tier_3', rank: 1, min: S.tiers.tier3Min },\n  { label: 'Unqualified', value: 'unqualified', rank: 0, min: -Infinity },\n];\nconst tierForScore = (score) => TIERS.find((t) => score >= t.min);\nconst parseTier = (raw) => {\n  if (!raw) return null;\n  const k = String(raw).toLowerCase().replace(/[\\s-]+/g, '_');\n  if (['tier_1', 'tier1', '1', 't1'].includes(k)) return TIERS[0];\n  if (['tier_2', 'tier2', '2', 't2'].includes(k)) return TIERS[1];\n  if (['tier_3', 'tier3', '3', 't3'].includes(k)) return TIERS[2];\n  if (['unqualified', 'none', 'not_icp', '0'].includes(k)) return TIERS[3];\n  return null;\n};\n\n// ---------- Component 1: headcount growth velocity ----------\nfunction headcountComponent(c, flags) {\n  const H = S.headcount;\n  if (c.employeesCurrent === null) { flags.push('missing_headcount'); return { available: false, reason: 'missing_headcount' }; }\n  if (c.employeesBaseline === null || c.employeesBaseline <= 0) { flags.push('missing_headcount_baseline'); return { available: false, reason: 'missing_baseline' }; }\n  let days = 7;\n  if (c.baselineDate) {\n    days = (ref - new Date(c.baselineDate)) / DAY;\n    if (days < 1) days = 1;\n  } else {\n    flags.push('baseline_date_assumed_7d');\n  }\n  if (days > H.maxBaselineAgeDays) { flags.push('stale_headcount_baseline'); return { available: false, reason: 'stale_baseline', baselineAgeDays: round1(days) }; }\n  const totalPct = ((c.employeesCurrent - c.employeesBaseline) / c.employeesBaseline) * 100;\n  const weeklyPct = totalPct / (days / 7);\n  let score;\n  if (weeklyPct >= H.growthCeilingPct) score = 100;\n  else if (weeklyPct <= H.declineFloorPct) score = 0;\n  else if (weeklyPct >= 0) score = H.flatScore + (weeklyPct / H.growthCeilingPct) * (100 - H.flatScore);\n  else score = H.flatScore * (1 - weeklyPct / H.declineFloorPct);\n  return {\n    available: true,\n    score: round1(clamp(score, 0, 100)),\n    detail: { headcountDelta: c.employeesCurrent - c.employeesBaseline, totalPct: round1(totalPct), weeklyPct: Math.round(weeklyPct * 100) / 100, baselineAgeDays: round1(days) },\n  };\n}\n\n// ---------- Component 2: funding signal ----------\nfunction fundingComponent(c, flags) {\n  const F = S.funding;\n  if (c.fundingStage === null) { flags.push('missing_funding'); return { available: false, reason: 'missing_funding' }; }\n  if (c.fundingStage === 'unknown') flags.push('unrecognized_funding_stage');\n  const base = Number(F.stagePoints[c.fundingStage] ?? 0);\n  if (c.fundingStage === 'none') return { available: true, score: 0, detail: { stage: 'none', basePoints: 0, recencyMultiplier: 0, ageDays: null } };\n  let ageDays = null;\n  let mult;\n  if (!c.fundingDate) {\n    mult = F.unknownDateMultiplier;\n    flags.push('funding_date_unknown');\n  } else {\n    ageDays = (ref - new Date(c.fundingDate)) / DAY;\n    if (ageDays < 0) { flags.push('funding_date_in_future'); mult = 1; }\n    else if (ageDays <= F.fullCreditDays) mult = 1;\n    else if (ageDays >= F.decayDays) mult = F.floorMultiplier;\n    else mult = 1 - (1 - F.floorMultiplier) * ((ageDays - F.fullCreditDays) / (F.decayDays - F.fullCreditDays));\n  }\n  return {\n    available: true,\n    score: round1(clamp(base * mult, 0, 100)),\n    detail: { stage: c.fundingStage, basePoints: base, recencyMultiplier: Math.round(mult * 1000) / 1000, ageDays: ageDays === null ? null : Math.round(ageDays), amountUsd: c.fundingAmountUsd },\n  };\n}\n\n// ---------- Component 3: technographic match ----------\nfunction technographicComponent(c, flags) {\n  if (!c.technographics.length) { flags.push('missing_technographics'); return { available: false, reason: 'missing_technographics' }; }\n  const matched = [];\n  let raw = 0;\n  let maxPossible = 0;\n  for (const [category, techs] of Object.entries(S.techMatrix || {})) {\n    const entries = Object.entries(techs || {}).map(([t, pts]) => [String(t).toLowerCase(), Number(pts) || 0]);\n    const positives = entries.filter(([, pts]) => pts > 0);\n    if (positives.length) maxPossible += Math.max(...positives.map(([, pts]) => pts));\n    let bestPositive = 0;\n    let negatives = 0;\n    for (const [tech, pts] of entries) {\n      if (!c.technographics.includes(tech)) continue;\n      matched.push({ category, tech, points: pts });\n      if (pts > 0) bestPositive = Math.max(bestPositive, pts);\n      else negatives += pts;\n    }\n    raw += bestPositive + negatives;\n  }\n  const score = maxPossible > 0 ? clamp((raw / maxPossible) * 100, 0, 100) : 0;\n  return { available: true, score: round1(score), detail: { rawPoints: raw, maxPossible, matched, unmatched: c.technographics.filter((t) => !matched.some((m) => m.tech === t)) } };\n}\n\n// ---------- Component 4: firmographic fit ----------\nfunction firmographicComponent(c, flags) {\n  const Fm = S.firmographic;\n  const parts = [];\n  const detail = {};\n  if (c.employeesCurrent !== null) {\n    let band;\n    if (c.employeesCurrent >= Fm.employeeMin && c.employeesCurrent <= Fm.employeeMax) band = 100;\n    else if (c.employeesCurrent < Fm.employeeMin) band = (c.employeesCurrent / Fm.employeeMin) * 100;\n    else band = Math.max(20, (Fm.employeeMax / c.employeesCurrent) * 100);\n    parts.push({ score: band, w: Fm.employeeBandWeight });\n    detail.employeeBandScore = round1(band);\n  }\n  if (c.industry) {\n    const hit = Fm.targetIndustries.includes(c.industry);\n    parts.push({ score: hit ? 100 : Fm.offTargetIndustryScore, w: Fm.industryWeight });\n    detail.industryMatch = hit;\n  }\n  if (!parts.length) { flags.push('missing_firmographics'); return { available: false, reason: 'missing_firmographics' }; }\n  const wSum = parts.reduce((a, p) => a + p.w, 0);\n  const score = parts.reduce((a, p) => a + p.score * p.w, 0) / wSum;\n  return { available: true, score: round1(clamp(score, 0, 100)), detail };\n}\n\nconst out = [];\nfor (const c of inputs) {\n  if (!c.companyId) continue;\n  const flags = [];\n  const components = {\n    headcountGrowth: headcountComponent(c, flags),\n    funding: fundingComponent(c, flags),\n    technographic: technographicComponent(c, flags),\n    firmographic: firmographicComponent(c, flags),\n  };\n  let availableWeight = 0;\n  let weighted = 0;\n  let availableCount = 0;\n  for (const [key, comp] of Object.entries(components)) {\n    comp.weight = S.weights[key];\n    if (comp.available) {\n      availableCount++;\n      availableWeight += comp.weight;\n      weighted += comp.score * comp.weight;\n    }\n  }\n  for (const comp of Object.values(components)) {\n    comp.effectiveWeight = comp.available && availableWeight > 0 ? Math.round((comp.weight / availableWeight) * 10000) / 10000 : 0;\n  }\n  const dataCompleteness = Math.round(availableWeight * 100);\n  const insufficientData = availableCount < S.minComponents || availableWeight <= 0;\n\n  let previousTier = parseTier(c.previousTierRaw);\n  if (!previousTier && c.previousScore !== null) previousTier = tierForScore(c.previousScore);\n  if (c.previousTierRaw && !parseTier(c.previousTierRaw)) flags.push('unrecognized_previous_tier');\n\n  let compositeScore = null;\n  let rawTier = null;\n  let tier = previousTier;\n  let hysteresisHeld = false;\n  let tierChange;\n  let scoreDelta = null;\n  let driftDetected = false;\n\n  if (insufficientData) {\n    tierChange = 'insufficient_data';\n  } else {\n    compositeScore = round1(weighted / availableWeight);\n    rawTier = tierForScore(compositeScore);\n    tier = rawTier;\n    if (previousTier && rawTier.rank < previousTier.rank && Number.isFinite(previousTier.min)\n        && compositeScore >= previousTier.min - S.tiers.hysteresisPoints) {\n      tier = previousTier;\n      hysteresisHeld = true;\n    }\n    if (!previousTier) tierChange = 'initial';\n    else if (tier.rank > previousTier.rank) tierChange = 'upgrade';\n    else if (tier.rank < previousTier.rank) tierChange = 'downgrade';\n    else tierChange = hysteresisHeld ? 'held_by_hysteresis' : 'unchanged';\n    if (c.previousScore !== null) {\n      scoreDelta = round1(compositeScore - c.previousScore);\n      driftDetected = Math.abs(scoreDelta) >= S.driftThreshold;\n    }\n  }\n\n  let shouldWrite = false;\n  let writeReason = 'no_material_change';\n  const lastCalcAgeDays = c.previousCalculatedAt ? (ref - new Date(c.previousCalculatedAt)) / DAY : null;\n  if (insufficientData) writeReason = 'insufficient_data';\n  else if (S.writePolicy === 'all') { shouldWrite = true; writeReason = 'policy_all'; }\n  else if (tierChange === 'initial') { shouldWrite = true; writeReason = 'first_score'; }\n  else if (tierChange === 'upgrade' || tierChange === 'downgrade') { shouldWrite = true; writeReason = 'tier_change'; }\n  else if (driftDetected) { shouldWrite = true; writeReason = 'score_drift'; }\n  else if (lastCalcAgeDays === null || lastCalcAgeDays >= S.staleAfterDays) { shouldWrite = true; writeReason = 'refresh_stale'; }\n\n  let hubspotUpdate = null;\n  if (shouldWrite) {\n    const abbreviations = { headcountGrowth: 'HC', funding: 'FD', technographic: 'TG', firmographic: 'FM' };\n    const breakdown = Object.entries(components)\n      .map(([k, v]) => `${abbreviations[k]}:${v.available ? v.score : 'na'}`)\n      .join('|') + `|DC:${dataCompleteness}%`;\n    const properties = {\n      [P.score]: compositeScore,\n      [P.tier]: tier.value,\n      [P.recalculatedAt]: cfg.runStartedAt,\n    };\n    if (P.scoreDelta && scoreDelta !== null) properties[P.scoreDelta] = scoreDelta;\n    if (P.scoreBreakdown) properties[P.scoreBreakdown] = breakdown;\n    if (c.employeesCurrent !== null && P.headcountBaseline) {\n      properties[P.headcountBaseline] = c.employeesCurrent;\n      if (P.headcountBaselineDate) properties[P.headcountBaselineDate] = ref.toISOString().slice(0, 10);\n    }\n    hubspotUpdate = { id: c.companyId, properties };\n  }\n\n  out.push({\n    json: {\n      companyId: c.companyId,\n      name: c.name,\n      domain: c.domain,\n      industry: c.industry,\n      ownerId: c.ownerId,\n      source: c.source,\n      referenceDate: ref.toISOString(),\n      compositeScore,\n      previousScore: c.previousScore,\n      scoreDelta,\n      driftDetected,\n      rawTier: rawTier ? rawTier.label : null,\n      tier: tier ? tier.label : null,\n      tierValue: tier ? tier.value : null,\n      previousTier: previousTier ? previousTier.label : null,\n      tierChange,\n      hysteresisHeld,\n      dataCompleteness,\n      insufficientData,\n      dataQualityFlags: flags,\n      components,\n      shouldWrite,\n      writeReason,\n      hubspotUpdate,\n      _ingest: ingest,\n    },\n  });\n}\nreturn out.length ? out : [{ json: { _noRecords: true, _ingest: ingest } }];\n"
+      },
+      "id": "4dcc0b8d-4b4b-5e41-8c03-e05be92bc92e",
+      "name": "Account Scoring & Tier Recalibration Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        400
+      ],
+      "notes": "Composite ICP score, tiers, hysteresis, drift",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Build HubSpot Batch Payloads\n// Chunks write-eligible updates into /crm/v3/objects/companies/batch/update\n// payloads (max 100 inputs each) and applies circuit breakers:\n//   - MAX_WRITES_PER_RUN caps the blast radius of a single run\n//   - MAX_TIER_CHANGE_RATIO blocks writes when an abnormal share of\n//     accounts change tier (usually a broken enrichment feed)\n// =====================================================================\nconst cfg = $('Config & Safety Gate').first().json;\nconst rows = $input.all().map((i) => i.json).filter((r) => r.companyId);\n\nconst writable = rows.filter((r) => r.shouldWrite && r.hubspotUpdate);\nconst withPreviousTier = rows.filter((r) => r.previousTier && !r.insufficientData);\nconst tierMoves = withPreviousTier.filter((r) => r.tierChange === 'upgrade' || r.tierChange === 'downgrade').length;\nconst tierChangeRatio = withPreviousTier.length ? tierMoves / withPreviousTier.length : 0;\n\nlet blockReason = null;\nif (writable.length > cfg.safety.maxWritesPerRun) {\n  blockReason = `Circuit breaker: ${writable.length} writes exceed MAX_WRITES_PER_RUN (${cfg.safety.maxWritesPerRun}).`;\n} else if (withPreviousTier.length >= cfg.safety.circuitBreakerMinSample && tierChangeRatio > cfg.safety.maxTierChangeRatio) {\n  blockReason = `Circuit breaker: ${(tierChangeRatio * 100).toFixed(1)}% of accounts changed tier (limit ${(cfg.safety.maxTierChangeRatio * 100).toFixed(0)}%). Check enrichment feeds before writing.`;\n}\n\nlet writeMode = cfg.writeMode;\nif (writeMode === 'live' && blockReason) writeMode = 'blocked';\nconst liveWrite = writeMode === 'live';\n\nconst guard = {\n  writableCount: writable.length,\n  scoredWithPreviousTier: withPreviousTier.length,\n  tierMoves,\n  tierChangeRatio: Math.round(tierChangeRatio * 1000) / 1000,\n  blockReason,\n};\n\nif (!writable.length) {\n  return [{ json: { batchIndex: 0, batchCount: 0, inputCount: 0, liveWrite: false, writeMode: 'no_changes', configuredWriteMode: cfg.writeMode, guard, payload: { inputs: [] } } }];\n}\n\nconst size = cfg.hubspot.batchSize;\nconst chunks = [];\nfor (let i = 0; i < writable.length; i += size) chunks.push(writable.slice(i, i + size));\n\nreturn chunks.map((chunk, idx) => ({\n  json: {\n    batchIndex: idx,\n    batchCount: chunks.length,\n    inputCount: chunk.length,\n    companyIds: chunk.map((r) => r.companyId),\n    liveWrite,\n    writeMode,\n    configuredWriteMode: cfg.writeMode,\n    guard,\n    endpoint: `${cfg.hubspot.apiBaseUrl}/crm/v3/objects/companies/batch/update`,\n    payload: { inputs: chunk.map((r) => r.hubspotUpdate) },\n  },\n}));\n"
+      },
+      "id": "2ba77a54-b9a0-58d0-a1e6-0ea9e5ad319e",
+      "name": "Build HubSpot Batch Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        400
+      ],
+      "notes": "Chunks of ≤100 + circuit breakers",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c7dfe58f-fd18-587c-93e4-732f8ef3c509",
+              "leftValue": "={{ $json.liveWrite }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f9938451-660d-5f0a-801c-0e54aaef559d",
+      "name": "Live Write Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        400
+      ],
+      "notes": "Only true when every safety flag allows it",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.endpoint }}",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "53540ea9-30d2-5bb5-92e5-19b962d78a72",
+      "name": "HubSpot: Batch Update Companies",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        280
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "POST /crm/v3/objects/companies/batch/update",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Simulate Write (Dry Run)\n// Produces a HubSpot-shaped batch response WITHOUT calling the API.\n// Reached whenever writeMode is sandbox, dry_run, updates_disabled,\n// missing_token, blocked or no_changes.\n// =====================================================================\nreturn $input.all().map((item) => {\n  const b = item.json;\n  const now = new Date().toISOString();\n  return {\n    json: {\n      simulated: true,\n      batchIndex: b.batchIndex,\n      writeMode: b.writeMode,\n      status: b.inputCount ? 'SIMULATED' : 'NOTHING_TO_WRITE',\n      startedAt: now,\n      completedAt: now,\n      results: (b.payload.inputs || []).map((i) => ({ id: i.id, properties: i.properties, simulated: true })),\n      errors: [],\n    },\n  };\n});\n"
+      },
+      "id": "21d1ac28-3ec1-56a9-8cd3-6482707d8aa4",
+      "name": "Simulate Write (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        520
+      ],
+      "notes": "No API call — HubSpot-shaped simulated response",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Collect Write Results\n// Reconciles batch responses (live or simulated) against the batches\n// that were built, into one write summary. Handles HTTP 200 (COMPLETE),\n// 207 multi-status (partial errors) and node-level request failures.\n// =====================================================================\nconst batches = $('Build HubSpot Batch Payloads').all().map((i) => i.json);\nconst responses = $input.all().map((i) => i.json);\nconst first = batches[0] || { writeMode: 'no_changes', guard: {} };\n\nconst summary = {\n  writeMode: first.writeMode,\n  configuredWriteMode: first.configuredWriteMode,\n  simulated: responses.every((r) => r.simulated === true),\n  batches: batches.filter((b) => b.inputCount > 0).length,\n  attempted: 0,\n  succeeded: 0,\n  simulatedWrites: 0,\n  failed: 0,\n  errors: [],\n  guard: first.guard || {},\n};\n\nbatches.forEach((b, idx) => {\n  if (!b.inputCount) return;\n  summary.attempted += b.inputCount;\n  const r = responses[idx] || {};\n  if (r.error) {\n    summary.failed += b.inputCount;\n    const msg = typeof r.error === 'string' ? r.error : (r.error.message || JSON.stringify(r.error));\n    summary.errors.push({ batchIndex: b.batchIndex, message: String(msg).slice(0, 300) });\n    return;\n  }\n  const ok = Array.isArray(r.results) ? r.results.length : 0;\n  const errs = Array.isArray(r.errors) ? r.errors : [];\n  if (r.simulated) summary.simulatedWrites += ok;\n  else summary.succeeded += ok;\n  summary.failed += r.simulated ? 0 : Math.max(0, b.inputCount - ok);\n  for (const e of errs.slice(0, 5)) {\n    summary.errors.push({ batchIndex: b.batchIndex, category: e.category || null, message: String(e.message || '').slice(0, 300) });\n  }\n});\nsummary.errors = summary.errors.slice(0, 10);\nsummary.status = summary.attempted === 0\n  ? 'nothing_to_write'\n  : summary.failed === 0 ? (summary.simulated ? 'simulated' : 'success') : (summary.succeeded > 0 ? 'partial_failure' : 'failed');\n\nreturn [{ json: { writeSummary: summary } }];\n"
+      },
+      "id": "8e1faa08-e57e-5cbd-803e-2269a3139cc7",
+      "name": "Collect Write Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        400
+      ],
+      "notes": "Reconciles 200 / 207 / request failures",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// RevOps Summary & Slack Builder\n// Builds run statistics and a Slack Block Kit message covering tier\n// upgrades/downgrades, average score shift, top movers, data-quality\n// gaps and the write execution result.\n// =====================================================================\nconst cfg = $('Config & Safety Gate').first().json;\nconst rows = $('Account Scoring & Tier Recalibration Engine').all().map((i) => i.json).filter((r) => r.companyId);\nconst write = $input.first().json.writeSummary;\nconst MAX = cfg.slack.maxListItems;\n\nconst scored = rows.filter((r) => !r.insufficientData);\nconst insufficient = rows.filter((r) => r.insufficientData);\nconst upgrades = scored.filter((r) => r.tierChange === 'upgrade');\nconst downgrades = scored.filter((r) => r.tierChange === 'downgrade');\nconst initial = scored.filter((r) => r.tierChange === 'initial');\nconst held = scored.filter((r) => r.hysteresisHeld);\nconst withDelta = scored.filter((r) => r.scoreDelta !== null);\nconst drifted = withDelta.filter((r) => r.driftDetected);\n\nconst avg = (arr) => (arr.length ? Math.round((arr.reduce((a, b) => a + b, 0) / arr.length) * 10) / 10 : null);\nconst avgScore = avg(scored.map((r) => r.compositeScore));\nconst avgShift = avg(withDelta.map((r) => r.scoreDelta));\nconst avgAbsShift = avg(withDelta.map((r) => Math.abs(r.scoreDelta)));\n\nconst tierDistribution = { 'Tier 1': 0, 'Tier 2': 0, 'Tier 3': 0, Unqualified: 0 };\nfor (const r of scored) tierDistribution[r.tier] = (tierDistribution[r.tier] || 0) + 1;\n\nconst topMovers = [...withDelta].sort((a, b) => Math.abs(b.scoreDelta) - Math.abs(a.scoreDelta)).slice(0, MAX);\n\nconst fmtDelta = (d) => (d === null || d === undefined ? 'n/a' : `${d > 0 ? '+' : ''}${d}`);\nconst link = (r) => (cfg.hubspot.portalId\n  ? `<https://app.hubspot.com/contacts/${cfg.hubspot.portalId}/record/0-2/${r.companyId}|${r.name}>`\n  : r.name);\nconst truncate = (s, n = 2900) => (s.length > n ? `${s.slice(0, n - 20)}\\n…(truncated)` : s);\nconst lines = (arr, fn) => (arr.length ? arr.slice(0, MAX).map(fn).join('\\n') + (arr.length > MAX ? `\\n…and ${arr.length - MAX} more` : '') : '_None this run_');\n\nconst modeBadge = cfg.sandboxMode ? '🧪 SANDBOX (synthetic fixture)' : cfg.dryRun ? '🔍 DRY RUN (live read, no writes)' : '🟢 LIVE';\nconst writeIcon = { success: '✅', simulated: '🧪', nothing_to_write: '➖', partial_failure: '⚠️', failed: '❌' }[write.status] || 'ℹ️';\n\nconst summary = {\n  runId: cfg.runId,\n  referenceDate: rows[0] ? rows[0].referenceDate : null,\n  mode: modeBadge,\n  companiesEvaluated: rows.length,\n  companiesScored: scored.length,\n  insufficientData: insufficient.length,\n  upgrades: upgrades.length,\n  downgrades: downgrades.length,\n  initialAssignments: initial.length,\n  heldByHysteresis: held.length,\n  driftDetected: drifted.length,\n  averageScore: avgScore,\n  averageScoreShift: avgShift,\n  averageAbsoluteScoreShift: avgAbsShift,\n  tierDistribution,\n  write,\n};\n\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: '📊 Weekly ICP Score & Tier Recalibration', emoji: true } },\n  { type: 'context', elements: [{ type: 'mrkdwn', text: `${modeBadge} · Run \\`${cfg.runId}\\` · Ref date ${summary.referenceDate ? summary.referenceDate.slice(0, 10) : 'n/a'}` }] },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Accounts evaluated*\\n${rows.length}` },\n      { type: 'mrkdwn', text: `*Scored / insufficient data*\\n${scored.length} / ${insufficient.length}` },\n      { type: 'mrkdwn', text: `*Tier upgrades ⬆️*\\n${upgrades.length}` },\n      { type: 'mrkdwn', text: `*Tier downgrades ⬇️*\\n${downgrades.length}` },\n      { type: 'mrkdwn', text: `*Avg score shift*\\n${fmtDelta(avgShift)} pts (abs ${avgAbsShift ?? 'n/a'})` },\n      { type: 'mrkdwn', text: `*Avg composite score*\\n${avgScore ?? 'n/a'}` },\n    ],\n  },\n  { type: 'section', text: { type: 'mrkdwn', text: `*Tier distribution:* T1 ${tierDistribution['Tier 1']} · T2 ${tierDistribution['Tier 2']} · T3 ${tierDistribution['Tier 3']} · Unqualified ${tierDistribution.Unqualified}${initial.length ? ` · ${initial.length} first-time assignment(s)` : ''}${held.length ? ` · ${held.length} held by hysteresis` : ''}` } },\n  { type: 'divider' },\n  { type: 'section', text: { type: 'mrkdwn', text: truncate(`*⬆️ Upgrades*\\n${lines(upgrades, (r) => `• ${link(r)}: ${r.previousTier} → *${r.tier}* (${r.previousScore} → ${r.compositeScore}, ${fmtDelta(r.scoreDelta)})`)}`) } },\n  { type: 'section', text: { type: 'mrkdwn', text: truncate(`*⬇️ Downgrades*\\n${lines(downgrades, (r) => `• ${link(r)}: ${r.previousTier} → *${r.tier}* (${r.previousScore} → ${r.compositeScore}, ${fmtDelta(r.scoreDelta)})`)}`) } },\n];\nif (initial.length) {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`*🆕 First-time scores*\\n${lines(initial, (r) => `• ${link(r)}: *${r.tier}* (${r.compositeScore})`)}`) } });\n}\nblocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`*📈 Top score movers*\\n${lines(topMovers, (r) => `• ${r.name}: ${fmtDelta(r.scoreDelta)} → ${r.compositeScore} (${r.tier})${r.hysteresisHeld ? ' _held_' : ''}`)}`) } });\nif (insufficient.length) {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`*🩺 Insufficient signal data (not written)*\\n${lines(insufficient, (r) => `• ${r.name}: ${r.dataQualityFlags.join(', ')}`)}`) } });\n}\nblocks.push({ type: 'divider' });\nblocks.push({\n  type: 'section',\n  text: {\n    type: 'mrkdwn',\n    text: truncate(`*${writeIcon} HubSpot write result:* \\`${write.status}\\` (mode \\`${write.writeMode}\\`)\\n${write.simulated ? `Simulated ${write.simulatedWrites} (no API call)` : `Attempted ${write.attempted} · Succeeded ${write.succeeded} · Failed ${write.failed}`} · Batches ${write.batches}${write.guard && write.guard.blockReason ? `\\n🛑 ${write.guard.blockReason}` : ''}${write.errors.length ? `\\nFirst error: ${write.errors[0].message}` : ''}`),\n  },\n});\nif (cfg.warnings.length) {\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: truncate(`⚠️ ${cfg.warnings.join(' | ')}`, 1900) }] });\n}\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `n8n-hubspot-account-scoring-matrix-dynamic-recalculator · ${cfg.slack.channelLabel}` }] });\n\nconst text = `ICP recalibration ${cfg.runId}: ${upgrades.length} upgrades, ${downgrades.length} downgrades, avg shift ${fmtDelta(avgShift)} pts, write ${write.status}.`;\n\nreturn [{ json: { summary, sendSlack: cfg.slackLive === true, slackPayload: { text, blocks: blocks.slice(0, 50) } } }];\n"
+      },
+      "id": "c75b6471-3ee5-5b1d-9b86-73af78d30dbc",
+      "name": "RevOps Summary & Slack Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        400
+      ],
+      "notes": "Block Kit: upgrades, downgrades, avg shift, write result",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c3e7ff19-49b1-5925-b13b-f83c999f906a",
+              "leftValue": "={{ $json.sendSlack }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f83d20a4-c99a-5dbd-9fd0-7edc61174aa2",
+      "name": "Send Slack Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        400
+      ],
+      "notes": "SEND_SLACK_ALERTS=true AND DRY_RUN=false AND URL set",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_SCORING_WEBHOOK_URL }}",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackPayload) }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "80b3a9dd-979e-55d4-8443-eaf4159ff96f",
+      "name": "Slack: Post Block Kit Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        280
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Incoming webhook from SLACK_SCORING_WEBHOOK_URL",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Slack Preview (Dry Run)\n// Slack delivery is disabled (SEND_SLACK_ALERTS=false, DRY_RUN=true or\n// no webhook URL). The Block Kit payload is kept in execution data so it\n// can be pasted into Slack's Block Kit Builder for review.\n// =====================================================================\nconst src = $input.first().json;\nreturn [{ json: { slackStatus: 'preview_only', blockCount: src.slackPayload.blocks.length, slackPayload: src.slackPayload } }];\n"
+      },
+      "id": "d5a53210-3b60-536f-8abe-0e6dca46f90f",
+      "name": "Slack Preview (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        520
+      ],
+      "notes": "Payload kept for Block Kit Builder review",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Execution Summary & Audit\n// Final, secret-free audit record of the run: effective config, safety\n// state, per-account outcomes and write/alert delivery status.\n// =====================================================================\nconst cfg = $('Config & Safety Gate').first().json;\nconst built = $('RevOps Summary & Slack Builder').first().json;\nconst rows = $('Account Scoring & Tier Recalibration Engine').all().map((i) => i.json).filter((r) => r.companyId);\nconst slackIn = $input.first().json;\n\nlet slackStatus;\nif (slackIn.slackStatus === 'preview_only') slackStatus = 'preview_only';\nelse if (slackIn.error) slackStatus = `failed: ${String(slackIn.error.message || slackIn.error).slice(0, 200)}`;\nelse slackStatus = 'delivered';\n\nconst write = built.summary.write;\nlet status = 'completed';\nif (write.status === 'failed' || write.status === 'partial_failure' || slackStatus.startsWith('failed')) status = 'completed_with_errors';\nif (write.guard && write.guard.blockReason) status = 'completed_writes_blocked';\n\nconst audit = {\n  auditVersion: '1.0.0',\n  workflow: 'n8n-hubspot-account-scoring-matrix-dynamic-recalculator',\n  runId: cfg.runId,\n  status,\n  runStartedAt: cfg.runStartedAt,\n  runCompletedAt: new Date().toISOString(),\n  referenceDate: built.summary.referenceDate,\n  safety: {\n    sandboxMode: cfg.sandboxMode,\n    dryRun: cfg.dryRun,\n    scoreUpdateEnabled: cfg.scoreUpdateEnabled,\n    sendSlackAlerts: cfg.sendSlackAlerts,\n    sendAuditWebhook: cfg.sendAuditWebhook,\n    envAccessible: cfg.envAccessible,\n    effectiveWriteMode: write.writeMode,\n    credentialsPresent: cfg.credentialsPresent,\n    circuitBreaker: write.guard,\n  },\n  scoringConfig: {\n    weights: cfg.scoring.weights,\n    tiers: cfg.scoring.tiers,\n    driftThreshold: cfg.scoring.driftThreshold,\n    minComponents: cfg.scoring.minComponents,\n    writePolicy: cfg.scoring.writePolicy,\n  },\n  ingest: rows[0] ? rows[0]._ingest : null,\n  results: built.summary,\n  delivery: { slack: slackStatus, auditWebhook: cfg.auditWebhookLive ? 'pending' : 'disabled' },\n  accounts: rows.map((r) => ({\n    companyId: r.companyId,\n    name: r.name,\n    previousScore: r.previousScore,\n    newScore: r.compositeScore,\n    scoreDelta: r.scoreDelta,\n    previousTier: r.previousTier,\n    newTier: r.tier,\n    tierChange: r.tierChange,\n    dataCompleteness: r.dataCompleteness,\n    flags: r.dataQualityFlags,\n    written: r.shouldWrite && ['live'].includes(write.writeMode) && write.status === 'success',\n    writeReason: r.writeReason,\n  })),\n  warnings: cfg.warnings,\n};\n\nreturn [{ json: { sendAuditWebhook: cfg.auditWebhookLive === true, audit } }];\n"
+      },
+      "id": "e65877db-bc42-53e0-a9ef-fe799a17f892",
+      "name": "Execution Summary & Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        400
+      ],
+      "notes": "Secret-free audit record",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "ee1fa5c1-9902-59c4-a95d-959d5433b458",
+              "leftValue": "={{ $json.sendAuditWebhook }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fe95cbeb-a052-5c96-985d-82ea724b5b35",
+      "name": "Send Audit Webhook?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        400
+      ],
+      "notes": "SEND_AUDIT_WEBHOOK=true AND DRY_RUN=false AND URL set",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ALERT_WEBHOOK_URL }}",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.audit) }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "274b3012-b1f8-56f0-a004-753d6c4fa6e2",
+      "name": "Audit Webhook: POST Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3600,
+        280
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "POST audit JSON to ALERT_WEBHOOK_URL",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "content": "## 🛡️ Safe by default\nImports in **SANDBOX_MODE=true · DRY_RUN=true · SCORE_UPDATE_ENABLED=false · SEND_SLACK_ALERTS=false**.\n\nOut of the box: zero HubSpot calls, zero CRM writes, zero Slack posts. Synthetic fixture only.\n\n**Live writes need ALL of:** SANDBOX_MODE=false, DRY_RUN=false, SCORE_UPDATE_ENABLED=true, HUBSPOT_ACCESS_TOKEN set, and no circuit breaker tripped.\n\nSecrets are read only via `$env` inside HTTP nodes and never copied into execution data.\n\nRequires `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`. If env access is blocked, the run falls back to sandbox + dry-run.",
+        "height": 420,
+        "width": 520,
+        "color": 4
+      },
+      "id": "3995ad6a-08e3-5265-9599-aa795455533c",
+      "name": "Safety Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 📐 Scoring matrix (defaults)\nHeadcount growth 30% · Funding 30% · Technographic 25% · Firmographic 15%\n\nTier 1 ≥ 80 · Tier 2 ≥ 60 · Tier 3 ≥ 40 · else Unqualified\n\nDowngrade hysteresis 3 pts · Drift alert ≥ 5 pts · Min 2 signal components\n\nAll weights, thresholds and matrices are env-configurable. See README.md.",
+        "height": 300,
+        "width": 460,
+        "color": 5
+      },
+      "id": "05af4e82-db5b-59fe-9954-1e5f3409fa91",
+      "name": "Scoring Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        -120
+      ]
+    }
+  ],
+  "connections": {
+    "Weekly Monday Schedule": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Safety Gate": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Load Synthetic Fixture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HubSpot: List Companies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Synthetic Fixture": {
+      "main": [
+        [
+          {
+            "node": "Normalize Company Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: List Companies": {
+      "main": [
+        [
+          {
+            "node": "Normalize Company Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Company Signals": {
+      "main": [
+        [
+          {
+            "node": "Account Scoring & Tier Recalibration Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Account Scoring & Tier Recalibration Engine": {
+      "main": [
+        [
+          {
+            "node": "Build HubSpot Batch Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build HubSpot Batch Payloads": {
+      "main": [
+        [
+          {
+            "node": "Live Write Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Write Enabled?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Batch Update Companies",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Write (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Batch Update Companies": {
+      "main": [
+        [
+          {
+            "node": "Collect Write Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Write (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Collect Write Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Write Results": {
+      "main": [
+        [
+          {
+            "node": "RevOps Summary & Slack Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RevOps Summary & Slack Builder": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Alert?": {
+      "main": [
+        [
+          {
+            "node": "Slack: Post Block Kit Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Preview (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Post Block Kit Alert": {
+      "main": [
+        [
+          {
+            "node": "Execution Summary & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Preview (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Execution Summary & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execution Summary & Audit": {
+      "main": [
+        [
+          {
+            "node": "Send Audit Webhook?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Audit Webhook?": {
+      "main": [
+        [
+          {
+            "node": "Audit Webhook: POST Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "description": "Scheduled analytics pipeline that dynamically recalibrates account tiers and ICP fit scores based on weekly headcount shifts, funding events, and technographic updates."
+  }
+}
